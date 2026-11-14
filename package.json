@@ -1,7 +1,7 @@
 {
-  "name": "imbpish-server",
-  "version": "1.0.0",
-  "description": "A secure personal assistant backend service",
+  "name": "imbpish-groq-server",
+  "version": "1.1.0",
+  "description": "I.M.B.P.I.S.H. backend using Groq API",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"

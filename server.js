@@ -4,77 +4,119 @@ const OpenAI = require("openai");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json({ limit: "20kb" }));
+app.use(express.json({ limit: "1mb" }));
 
-// السماح لتطبيق الهاتف بالاتصال بالخادم
+// CORS: required because the Android HTML app may be opened from a local file.
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
-// حد بسيط للطلبات لتقليل إساءة الاستخدام
-const requests = new Map();
+// Small in-memory request guard. This resets when the server restarts.
+const requestCounts = new Map();
+const WINDOW_MS = 60 * 1000;
+const MAX_REQUESTS_PER_WINDOW = 10;
 
 app.use("/chat", (req, res, next) => {
-  const ip = req.ip;
   const now = Date.now();
-  const record = requests.get(ip) || { count: 0, start: now };
+  const key = req.ip || req.socket.remoteAddress || "unknown";
+  const current = requestCounts.get(key);
 
-  if (now - record.start > 60 * 1000) {
-    record.count = 0;
-    record.start = now;
+  if (!current || now - current.startedAt >= WINDOW_MS) {
+    requestCounts.set(key, { startedAt: now, count: 1 });
+    return next();
   }
 
-  record.count++;
-  requests.set(ip, record);
-
-  if (record.count > 10) {
+  current.count += 1;
+  if (current.count > MAX_REQUESTS_PER_WINDOW) {
     return res.status(429).json({
-      error: "طلبات كثيرة. حاول بعد دقيقة."
+      error: "تم تجاوز عدد الطلبات المسموح مؤقتاً. حاول بعد دقيقة."
     });
   }
-
   next();
 });
 
-app.get("/", (req, res) => {
-  res.send("I.M.B.P.I.S.H. server is running");
+app.get("/", (_req, res) => {
+  res.send("I.M.B.P.I.S.H. Groq server is running.");
+});
+
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    provider: "Groq",
+    configured: Boolean(process.env.GROQ_API_KEY)
+  });
 });
 
 app.post("/chat", async (req, res) => {
   try {
-    const message = req.body.message;
+    const apiKey = process.env.GROQ_API_KEY;
+    if (!apiKey) {
+      return res.status(503).json({
+        error: "مفتاح Groq غير مضبوط في إعدادات الخادم."
+      });
+    }
 
-    if (typeof message !== "string" || !message.trim()) {
+    const message = typeof req.body.message === "string"
+      ? req.body.message.trim()
+      : "";
+
+    if (!message) {
       return res.status(400).json({ error: "اكتب رسالة أولاً." });
     }
 
-    if (!process.env.OPENAI_API_KEY) {
-      return res.status(500).json({ error: "الخادم غير مجهز بمفتاح API." });
+    if (message.length > 6000) {
+      return res.status(413).json({ error: "الرسالة طويلة جداً." });
     }
 
     const client = new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY
+      apiKey,
+      baseURL: "https://api.groq.com/openai/v1"
     });
 
-    const response = await client.responses.create({
-      model: "gpt-4.1-mini",
-      instructions: "أنت مساعد شخصي اسمه I.M.B.P.I.S.H. أجب باللغة العربية بوضوح وود، وكن مفيداً وآمناً.",
-      input: message.trim()
+    const completion = await client.chat.completions.create({
+      model: "openai/gpt-oss-20b",
+      messages: [
+        {
+          role: "system",
+          content: "أنت I.M.B.P.I.S.H.، مساعد شخصي ودود ومفيد. أجب باللغة العربية عندما يكتب المستخدم بالعربية، وكن واضحاً ومختصراً. لا تدّعِ أنك تتذكر معلومات لم تُذكر في سياق المحادثة."
+        },
+        { role: "user", content: message }
+      ],
+      max_completion_tokens: 700,
+      temperature: 0.7
     });
 
-    res.json({ reply: response.output_text });
+    const answer = completion.choices?.[0]?.message?.content?.trim();
+    if (!answer) {
+      return res.status(502).json({ error: "لم يصل رد نصي من نموذج الذكاء الاصطناعي." });
+    }
+
+    res.json({ reply: answer });
   } catch (error) {
-    console.error("Chat error:", error.message);
+    const status = error.status || 500;
+    console.error("Groq chat error:", status, error.message);
+
+    if (status === 401 || status === 403) {
+      return res.status(502).json({
+        error: "تعذّر التحقق من مفتاح Groq. راجع إعدادات GROQ_API_KEY في Render."
+      });
+    }
+    if (status === 429) {
+      return res.status(429).json({
+        error: "تم بلوغ حد الاستخدام المجاني في Groq مؤقتاً. انتظر حتى يتجدد الحد."
+      });
+    }
+
     res.status(500).json({
-      error: "حدث خطأ أثناء الاتصال بالمساعد. حاول لاحقاً."
+      error: "حدث خطأ أثناء الاتصال بخدمة الذكاء الاصطناعي."
     });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`I.M.B.P.I.S.H. Groq server listening on port ${PORT}`);
 });
